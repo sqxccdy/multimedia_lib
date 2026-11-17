@@ -32,7 +32,7 @@ class m3u8Download(ADPOperator):
     ) -> dict:
         if proxy != "auto":
             return self._download(url, proxy, output_dir)
-        socket_path = request_local_channel("http_proxy")
+        socket_path = request_local_channel("ProxyNode")
 
         class ChannelHandler(socketserver.BaseRequestHandler):
             def handle(self):

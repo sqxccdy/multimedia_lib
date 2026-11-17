@@ -1,6 +1,7 @@
 """通过 C2C TCP 通道提供支持 HTTP Range 的本地 MP4 播放。"""
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -18,8 +19,24 @@ from adp_operator.c2c.operator import PermanentOperator
 
 
 class VideoPlay(PermanentOperator):
-    http_port = int(os.getenv("VIDEO_PLAY_HTTP_PORT", "49998"))
+    http_port = int(os.getenv("VIDEO_PLAY_HTTP_PORT", "0"))
     http_routes = (
+        {
+            "method": "POST",
+            "path": "/video/files",
+            "handler": "upload_video",
+        },
+        {
+            "method": "DELETE",
+            "path": "/video/files",
+            "handler": "delete_video",
+        },
+        {
+            "method": "GET",
+            "path": "/video/files",
+            "handler": "video_http",
+            "channel": "video_http",
+        },
         {
             "method": "GET",
             "path": "/video/file",
@@ -93,6 +110,9 @@ class VideoPlay(PermanentOperator):
             ("127.0.0.1", self.http_port),
             VideoRequestHandler,
         )
+        port = self.server.server_address[1]
+        # serve() 用独立加载的算子类发布节点和通道元数据。
+        client.operator_class.http_port = port
         threading.Thread(
             target=self.server.serve_forever,
             name="video-play-http",
@@ -106,7 +126,7 @@ class VideoPlay(PermanentOperator):
         ).start()
         logging.info(
             "[视频] MP4 Range 服务监听 127.0.0.1:%s",
-            self.http_port,
+            port,
         )
 
     def _close_on_stop(self, stop_event) -> None:
@@ -120,6 +140,9 @@ class VideoPlay(PermanentOperator):
         send_body: bool,
     ) -> None:
         path = urlsplit(handler.path).path
+        if path == "/video/files":
+            self._serve_list(handler, send_body)
+            return
         if path == "/video/file":
             self._serve_file(handler, send_body)
             return
@@ -127,6 +150,100 @@ class VideoPlay(PermanentOperator):
             self._serve_thumbnail(handler, send_body)
             return
         self._send_error(handler, 404, "接口不存在")
+
+    def _serve_list(self, handler: BaseHTTPRequestHandler, send_body: bool) -> None:
+        query = parse_qs(urlsplit(handler.path).query)
+        requested = query.get("path", [None])[0]
+        try:
+            root, directory = self._resolve_directory(requested)
+            files = [
+                {"name": source.name, "path": str(source)}
+                for source in sorted(directory.iterdir(), key=lambda item: item.name.casefold())
+                if source.suffix.lower() == ".mp4"
+                and source.is_file()
+                and source.resolve().is_relative_to(root)
+            ]
+        except (PermissionError, FileNotFoundError, ValueError) as error:
+            status = self._file_error(error)["status"]
+            self._send_error(handler, status, str(error))
+            return
+        except (OSError, RuntimeError):
+            logging.exception("[视频] 读取视频目录失败")
+            self._send_error(handler, 500, "无法读取视频目录")
+            return
+        body = json.dumps({"directory": str(directory), "files": files}, ensure_ascii=False).encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        if send_body:
+            handler.wfile.write(body)
+
+    @staticmethod
+    def _resolve_directory(requested: str | None) -> tuple[Path, Path]:
+        configured_root = os.getenv("VIDEO_PLAY_ROOT")
+        root = Path(configured_root or "/mnt").expanduser().resolve()
+        default = root if configured_root else root / "loli"
+        directory = (root / Path(requested).expanduser()).resolve() if requested else default.resolve()
+        if not directory.is_relative_to(root):
+            raise PermissionError("目录必须位于视频库内")
+        if not directory.is_dir():
+            raise FileNotFoundError("视频目录不存在")
+        return root, directory
+
+    def _edit_target(self, request: dict[str, Any]) -> Path:
+        query = request.get("query") or {}
+        _, directory = self._resolve_directory(query.get("path"))
+        name = query.get("name", "")
+        if not re.fullmatch(r'[^/\\:\x00]+\.mp4', name, re.IGNORECASE):
+            raise ValueError("请输入有效的 MP4 文件名")
+        return directory / name
+
+    @staticmethod
+    def _file_error(error: Exception) -> dict[str, Any]:
+        if isinstance(error, FileExistsError):
+            status, message = 409, "同名文件已存在"
+        elif isinstance(error, FileNotFoundError):
+            status, message = 404, str(error)
+        elif isinstance(error, PermissionError):
+            logging.exception("[视频] 文件权限错误")
+            status, message = 403, (
+                "没有权限操作该视频目录或文件，请检查目录写入权限和挂载选项"
+            )
+        elif isinstance(error, ValueError):
+            status, message = 400, str(error)
+        else:
+            logging.exception("[视频] 文件操作失败")
+            status, message = 500, "视频文件操作失败"
+        return {"status": status, "body": {"error": message}}
+
+    def upload_video(self, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            target = self._edit_target(request)
+            body = request.get("body_bytes")
+            if not isinstance(body, bytes) or not body:
+                raise ValueError("请选择非空的 MP4 文件")
+            upload = target.open("xb")
+            try:
+                with upload:
+                    upload.write(body)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+        except (OSError, RuntimeError, ValueError) as error:
+            return self._file_error(error)
+        return {"status": 201, "body": {"name": target.name, "path": str(target)}}
+
+    def delete_video(self, request: dict[str, Any]) -> dict[str, Any]:
+        try:
+            target = self._edit_target(request)
+            if not target.is_symlink() and not target.is_file():
+                raise FileNotFoundError("视频文件不存在")
+            target.unlink()
+        except (OSError, RuntimeError, ValueError) as error:
+            return self._file_error(error)
+        return {"status": 200, "body": {"deleted": target.name}}
 
     def _serve_file(
         self,

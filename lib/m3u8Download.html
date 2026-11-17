@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>m3u8Download</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0f1115; color: #e6e9ee; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 800px; margin: auto; padding: 24px; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 18px; }
+    form, article { background: #161a21; border: 1px solid #313946; border-radius: 12px; padding: 16px; }
+    form, label, #tasks { display: grid; gap: 10px; }
+    label { gap: 5px; }
+    .options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    input, textarea, button { font: inherit; border: 1px solid #414b5b; border-radius: 8px; padding: 9px 12px; }
+    input, textarea { width: 100%; background: #0f1115; color: inherit; }
+    textarea { resize: vertical; }
+    button { justify-self: start; background: #94c8ff; color: #0f1724; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    article { overflow-wrap: anywhere; }
+    article p, pre { margin: 8px 0 0; }
+    pre { max-height: 10em; overflow: auto; white-space: pre-wrap; color: #b8c1d0; }
+    [hidden], #feedback:empty { display: none; }
+    #feedback { margin: 0; }
+    @media (max-width: 520px) {
+      main { padding: 16px; }
+      .options { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>M3U8 下载</h1>
+  <form id="download">
+    <label>M3U8 链接（每行一个）
+      <textarea id="urls" rows="4" required placeholder="https://example.com/stream.m3u8"></textarea>
+    </label>
+    <div class="options">
+      <label>保存目录
+        <input id="directory" value="/mnt/loli" required>
+      </label>
+      <label>代理
+        <input id="proxy" placeholder="留空使用 ProxyNode">
+      </label>
+    </div>
+    <button id="submit" type="submit">开始下载</button>
+    <p id="feedback" role="status"></p>
+  </form>
+  <section id="taskSection" hidden>
+    <h2>下载任务</h2>
+    <div id="tasks"></div>
+  </section>
+</main>
+<script>
+  const byId = id => document.getElementById(id);
+  const labels = { queued: "排队中", running: "下载中", succeeded: "已完成", failed: "失败" };
+
+  async function request(path, options) {
+    const response = await fetch(path, { cache: "no-store", ...options });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(data?.error || "HTTP " + response.status);
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  }
+
+  function addTask(url, taskId) {
+    const row = document.createElement("article");
+    const title = document.createElement("strong");
+    const status = document.createElement("p");
+    const detail = document.createElement("pre");
+    title.textContent = url;
+    status.textContent = labels.queued;
+    detail.hidden = true;
+    row.append(title, status, detail);
+    byId("taskSection").hidden = false;
+    byId("tasks").prepend(row);
+
+    async function poll() {
+      try {
+        const task = await request("/tasks?" + new URLSearchParams({ task_id: taskId }));
+        status.textContent = labels[task.status] || task.status;
+        detail.textContent = task.error || task.result?.file_path || task.latest_log || "";
+        detail.hidden = !detail.textContent;
+        if (task.status === "succeeded" || task.status === "failed") return;
+      } catch (error) {
+        status.textContent = error.status === 404 ? "任务已过期或不存在" : "暂时无法查询任务";
+        detail.textContent = error.message;
+        detail.hidden = false;
+        if (error.status === 404) return;
+      }
+      setTimeout(poll, 2000);
+    }
+    poll();
+  }
+
+  byId("download").addEventListener("submit", async event => {
+    event.preventDefault();
+    const urls = [...new Set(byId("urls").value.split(/\r?\n/).map(url => url.trim()).filter(Boolean))];
+    const outputDir = byId("directory").value.trim();
+    const proxy = byId("proxy").value.trim() || "auto";
+    const feedback = byId("feedback");
+    if (!urls.length || !outputDir) {
+      feedback.textContent = "请填写 M3U8 链接和保存目录。";
+      return;
+    }
+    byId("submit").disabled = true;
+    feedback.textContent = "正在提交任务…";
+    const failures = [];
+    for (const url of urls) {
+      try {
+        if (!/^https?:\/\//i.test(url)) throw new Error("请输入 HTTP 或 HTTPS 链接");
+        const task = await request("/tasks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            operator_name: "m3u8Download",
+            config: { init: {}, run: { url, proxy, output_dir: outputDir } },
+          }),
+        });
+        if (!task?.task_id) throw new Error("网关未返回任务 ID");
+        addTask(url, task.task_id);
+      } catch (error) {
+        failures.push({ url, message: error.message });
+      }
+    }
+    byId("urls").value = failures.map(failure => failure.url).join("\n");
+    feedback.textContent = failures.length
+      ? "已提交 " + (urls.length - failures.length) + " 个任务。提交失败：" +
+        failures.map(failure => failure.url + "（" + failure.message + "）").join("；")
+      : "已提交 " + urls.length + " 个任务。";
+    byId("submit").disabled = false;
+  });
+</script>
+</body>
+</html>
